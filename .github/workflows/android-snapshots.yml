@@ -1,0 +1,68 @@
+name: Android gen_snapshot (experimental)
+
+# Builds release/profile gen_snapshot for Android targets that runs on Termux.
+# Manual run only: it takes a few hours and is meant for iterating on the fork.
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: Termux host arch
+        default: arm64
+        type: choice
+        options: [arm64, x64]
+      android_cpu:
+        description: Android target CPUs, space separated (arm64 arm x64)
+        default: arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: snapshots-${{ inputs.arch }}
+          max-size: 4G
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfreetype-dev libfontconfig-dev ninja-build
+
+      - name: Setup depot_tools
+        uses: newkdev/setup-depot-tools@v1.0.1
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Build gen_snapshot
+        env:
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          python3 build.py \
+            --android-snapshots \
+            --android-cpu ${{ inputs.android_cpu }} \
+            --arch "${{ inputs.arch }}" \
+            --work-dir "$RUNNER_TEMP/flutter-build" \
+            --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-snapshots-${{ inputs.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error

@@ -44,6 +44,13 @@ MODE = "debug"
 NDK_HOST = "linux-x86_64"
 API = 26
 
+# Android-target gen_snapshot builds (host = Termux, target = Android).
+# EXPERIMENTAL: needed for `flutter build apk --release/--profile` on Termux.
+SNAPSHOT_MODES = ["release", "profile"]
+ANDROID_CPUS = ["arm64", "arm", "x64"]
+HOST_CLI = {"arm64": "linux-arm64", "x64": "linux-x64"}
+NDK_VERSION = "27.2.12479018"  # r27c
+
 # system libraries the engine is linked against; headers and .so files
 # are unpacked from the Termux repos into a fake sysroot.
 SYSROOT_REPOS = [
@@ -335,6 +342,98 @@ def package_tar(flutter, output, arch):
     print(f"created {output} ({size:.1f} MiB)", flush=True)
 
 
+def android_out_dir(flutter, mode, cpu):
+    return flutter / "engine/src/out" / f"android_{mode}_{cpu}"
+
+
+def configure_android(flutter, ndk, mode, cpu, sysroot):
+    """GN config whose only goal is a Termux-runnable gen_snapshot that emits
+    code for android-<cpu> in <mode>. Mirrors configure(); drop any flag that
+    `gn` rejects for --android."""
+    toolchain = ndk / "toolchains/llvm/prebuilt" / NDK_HOST
+    if not toolchain.is_dir():
+        fail(f"NDK toolchain not found: {toolchain}")
+    termux_host = (
+        os.environ.get("PREFIX") == "/data/data/com.termux/files/usr")
+
+    command = [
+        "vpython3", "engine/src/flutter/tools/gn",
+        "--android",
+        "--android-cpu", cpu,
+        "--no-goma",
+        "--no-backtrace",
+        "--clang",
+        "--lto",
+        "--ccache",
+        "--no-enable-unittests",
+        "--no-prebuilt-dart-sdk",
+        "--target-toolchain", toolchain,
+        "--runtime-mode", mode,
+        "--gn-args", "symbol_level=0",
+        "--gn-args", "dart_include_wasm_opt=false",
+        "--gn-args", "dart_platform_sdk=false",
+        "--gn-args", "dart_support_perfetto=false",
+        "--gn-args", "skia_use_perfetto=false",
+        "--gn-args", "use_default_linux_sysroot=false",
+        "--gn-args", f'custom_sysroot="{sysroot}"',
+        "--gn-args", "is_termux=true",
+        "--gn-args", f"is_termux_host={str(termux_host).lower()}",
+        "--gn-args", f"termux_api_level={API}",
+        # download_android_deps is off, so point GN at the CI NDK.
+        "--gn-args", f'android_ndk_root="{ndk}"',
+        "--gn-args", f'android_ndk_version="{NDK_VERSION}"',
+    ]
+    run(command, cwd=flutter)
+
+
+def build_gen_snapshot(flutter, mode, cpu, jobs):
+    out = android_out_dir(flutter, mode, cpu)
+    base = ["ninja", "-C", out]
+    if jobs:
+        base.append(f"-j{jobs}")
+    try:
+        run(base + ["gen_snapshot"])
+    except subprocess.CalledProcessError:
+        print("gen_snapshot target failed, falling back to `flutter`",
+              flush=True)
+        run(base + ["-k", "0", "flutter"])
+
+
+def find_gen_snapshot(out, host_arch):
+    """Return the gen_snapshot ELF built for the Termux host arch."""
+    machines = {"aarch64": 183, "x86_64": 62, "arm": 40, "i686": 3}
+    for path in sorted(out.rglob("gen_snapshot")):
+        if not path.is_file():
+            continue
+        with open(path, "rb") as f:
+            head = f.read(20)
+        if head[:4] == b"\x7fELF" and (
+                int.from_bytes(head[18:20], "little") == machines[host_arch]):
+            return path
+    fail(f"no {host_arch} gen_snapshot found under {out}")
+
+
+def build_android_snapshots(flutter, ndk, host, sysroot, cpus, jobs, stage):
+    for cpu in cpus:
+        for mode in SNAPSHOT_MODES:
+            configure_android(flutter, ndk, mode, cpu, sysroot)
+            build_gen_snapshot(flutter, mode, cpu, jobs)
+            found = find_gen_snapshot(android_out_dir(flutter, mode, cpu),
+                                      ARCHES[host])
+            dest = stage / f"android-{cpu}-{mode}" / HOST_CLI[host]
+            copy(found, dest / "gen_snapshot")
+            print(f"gen_snapshot [{cpu}/{mode}] -> {dest}", flush=True)
+
+
+def package_snapshots(stage, output):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.unlink(missing_ok=True)
+    with tarfile.open(output, "w:gz", compresslevel=9) as tar:
+        for entry in sorted(stage.iterdir()):
+            tar.add(entry, arcname=entry.name)
+    print(f"created {output}", flush=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Build Flutter for Termux and package it as tar.gz")
@@ -346,6 +445,13 @@ def parse_args():
     parser.add_argument("--work-dir", default=".work")
     parser.add_argument("--output-dir", default="dist")
     parser.add_argument("--patches", default="patches")
+    parser.add_argument(
+        "--android-snapshots", action="store_true",
+        help="only build release/profile gen_snapshot for Android targets "
+             "(skips the Linux debug engine and the SDK tarball)")
+    parser.add_argument(
+        "--android-cpu", nargs="+", default=["arm64"], choices=ANDROID_CPUS,
+        help="Android target CPUs for --android-snapshots (default: arm64)")
     return parser.parse_args()
 
 
@@ -371,6 +477,19 @@ def main():
     apply_patches(flutter, patches)
 
     sysroot = make_sysroot(work, arch)
+
+    if args.android_snapshots:
+        stage = work / "android_snapshots"
+        shutil.rmtree(stage, ignore_errors=True)
+        build_android_snapshots(
+            flutter, Path(ndk), args.arch, sysroot, args.android_cpu,
+            args.jobs, stage)
+        package_snapshots(
+            stage,
+            Path(args.output_dir).resolve()
+            / f"android_snapshots_{version}_{arch}.tar.gz")
+        return
+
     configure(flutter, Path(ndk), args.arch, sysroot)
     build(flutter, args.arch, args.jobs)
 
